@@ -1,11 +1,11 @@
 /* ============================================================
    GLOBAL PAGE
    ============================================================ */
-
 .cineview-page {
   position: relative;
   min-height: 100vh;
-  overflow: hidden;
+  overflow-x: clip;
+  overflow-y: visible;
   background:
     radial-gradient(
       circle at 50% 18%,
@@ -288,17 +288,15 @@
 /* ============================================================
    HERO
    ============================================================ */
-
 .hero-section {
   position: relative;
   z-index: 8;
   width: min(1180px, calc(100% - 48px));
-  min-height: 690px;
   margin: 0 auto;
-  padding: 82px 0 120px;
+  padding: 72px 0 72px;
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(420px, 0.86fr);
-  align-items: center;
+  align-items: start;
   gap: clamp(50px, 7vw, 110px);
 }
 
@@ -824,8 +822,10 @@
   }
 
   .hero-section {
-    grid-template-columns: 1fr;
-    padding-top: 65px;
+  grid-template-columns: 1fr;
+  padding-top: 58px;
+  padding-bottom: 70px;
+  gap: 58px;
   }
 
   .hero-copy {
@@ -865,8 +865,9 @@
   }
 
   .hero-section {
-    padding-top: 50px;
-    padding-bottom: 90px;
+  padding-top: 42px;
+  padding-bottom: 58px;
+  gap: 42px;
   }
 
   .hero-copy h1 {
@@ -1674,5 +1675,61 @@
 
   .aspect-panel__footer {
     flex-direction: column;
+  }
+}
+/* ============================================================
+   MOBILE SAFETY
+   ============================================================ */
+
+.hero-section > *,
+.analysis-column,
+.screening-panel,
+.analysis-result,
+.verdict-panel,
+.aspect-panel {
+  min-width: 0;
+}
+
+@media (max-width: 480px) {
+  .cineview-header {
+    padding-top: 82px;
+    padding-bottom: 22px;
+  }
+
+  .cineview-brand__title {
+    font-size: 22px;
+  }
+
+  .hero-copy h1 {
+    font-size: clamp(34px, 11vw, 52px);
+  }
+
+  .screening-panel__header {
+    padding-top: 23px;
+    padding-bottom: 19px;
+  }
+
+  .screening-panel h2 {
+    font-size: 22px;
+  }
+
+  .review-paper {
+    padding-top: 22px;
+    padding-bottom: 24px;
+  }
+
+  .review-paper textarea {
+    min-height: 155px;
+    font-size: 15px;
+  }
+
+  .verdict-panel__body {
+    padding-left: 21px;
+    padding-right: 21px;
+  }
+
+  .verdict-panel__description {
+    padding-left: 21px;
+    padding-right: 21px;
   }
 }

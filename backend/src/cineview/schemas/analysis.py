@@ -1,10 +1,9 @@
 from typing import Literal
 
 from pydantic import BaseModel, Field
-
 class AspectInsight(BaseModel):
     """
-    Semantic aspect-level sentiment result.
+    Continuous aspect-level sentiment result produced by LM6.
     """
 
     name: str
@@ -15,7 +14,9 @@ class AspectInsight(BaseModel):
         "Neutral",
     ]
 
-    score: int
+    score: float
+
+    raw_score: float
 
     confidence: float
 
@@ -26,7 +27,6 @@ class AspectInsight(BaseModel):
     probabilities: dict[str, float] = Field(
         default_factory=dict
     )
-
 
 class ReviewRequest(BaseModel):
     """

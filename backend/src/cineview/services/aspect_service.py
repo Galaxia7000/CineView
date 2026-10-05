@@ -1,397 +1,339 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
+import torch
 from transformers import (
     AutoModelForSequenceClassification,
-    AutoModelForTokenClassification,
     AutoTokenizer,
-    pipeline,
 )
 
 
 class AspectService:
     """
-    Semantic Aspect-Based Sentiment Analysis.
+    CineView movie aspect intelligence.
 
-    Stage 1:
-        Extract aspect terms from the review.
+    Uses Lowerated/deberta-v3-lm6 to predict continuous sentiment
+    scores for seven movie-related aspects.
 
-    Stage 2:
-        Classify sentiment for each (review, aspect) pair.
+    A conservative explicit aspect-presence gate is applied first.
+    LM6 is then used only for aspects that are actually referenced
+    in the review.
 
-    Overall review sentiment continues to come from the
-    custom CineView GRU model.
+    Overall review sentiment remains handled separately by the
+    CineView GRU model.
+
+    IMPORTANT:
+        LM6 outputs regression-style aspect scores, not probabilities.
+        The raw model prediction is preserved separately from the
+        bounded CineView score.
     """
 
-    ASPECT_MODEL_ID = (
-        "yangheng/deberta-v3-base-end2end-absa"
+    MODEL_ID = "Lowerated/deberta-v3-lm6"
+
+    # The documented LM6 aspect ordering.
+    ASPECT_COLUMNS = (
+        "Cinematography",
+        "Direction",
+        "Story",
+        "Characters",
+        "Production Design",
+        "Unique Concept",
+        "Emotions",
     )
 
-    SENTIMENT_MODEL_ID = (
-        "yangheng/deberta-v3-base-absa-v1.1"
-    )
+    MODEL_MAX_LENGTH = 512
+
+    # Calibrated against the labeled IMDb aspect dataset.
+    #
+    # score >= +0.24 -> Positive
+    # score <= -0.24 -> Negative
+    # otherwise       -> Neutral
+    NEUTRAL_THRESHOLD = 0.24
 
     # ========================================================
-    # CineView aspect categories
+    # EXPLICIT ASPECT-PRESENCE VOCABULARY
+    #
+    # These terms are ONLY used to determine whether an aspect
+    # is explicitly discussed.
+    #
+    # They do NOT determine sentiment.
+    # Sentiment continues to come entirely from LM6.
     # ========================================================
 
-    ASPECT_CATEGORIES = {
-        "Acting": {
-            "acting",
-            "performance",
-            "performances",
-            "actor",
-            "actors",
-            "actress",
-            "actresses",
-            "cast",
-        },
-        "Story": {
+    ASPECT_TERMS = {
+        "Cinematography": (
+            "cinematography",
+            "camera work",
+            "camera",
+            "cameras",
+            "shot",
+            "shots",
+            "framing",
+            "composition",
+            "lighting",
+            "lens",
+            "lenses",
+            "color grading",
+            "colour grading",
+            "visual effects",
+            "visual effect",
+            "visuals",
+            "vfx",
+            "cgi",
+            "photography",
+            "visual treat",
+            "movie looked",
+            "film looked",
+        ),
+
+        "Direction": (
+            "direction",
+            "director",
+            "directing",
+            "directed",
+            "directorial",
+            "filmmaker",
+            "filmmaking",
+            "helmed",
+        ),
+
+        "Story": (
             "story",
             "plot",
             "narrative",
-            "storyline",
-            "ending",
-        },
-        "Screenplay": {
             "screenplay",
             "script",
             "writing",
             "writer",
-        },
-        "Direction": {
-            "direction",
-            "director",
-            "directing",
-        },
-        "Cinematography": {
-            "cinematography",
-            "camera work",
-            "camera",
-        },
-        "Visuals": {
-            "visual",
-            "visuals",
-            "visual effect",
-            "visual effects",
-            "effects",
-            "special effects",
-            "cgi",
-            "vfx",
-            "animation",
-            "graphics",
-        },
-        "Music": {
-            "music",
-            "soundtrack",
-            "score",
-            "song",
-            "songs",
-        },
-        "Sound": {
-            "sound",
-            "sound design",
-            "audio",
-        },
-        "Characters": {
-            "character",
-            "characters",
-            "protagonist",
-            "antagonist",
-        },
-        "Dialogue": {
+            "storyline",
+            "ending",
             "dialogue",
             "dialog",
             "lines",
-        },
-        "Pacing": {
             "pacing",
             "pace",
-        },
+        ),
+
+        "Characters": (
+            "character",
+            "characters",
+            "acting",
+            "actor",
+            "actors",
+            "actress",
+            "actresses",
+            "performance",
+            "performances",
+            "cast",
+            "protagonist",
+            "antagonist",
+            "portrayal",
+            "role",
+            "roles",
+        ),
+
+        "Production Design": (
+            "production design",
+            "production designer",
+            "set design",
+            "set designs",
+            "sets",
+            "interior",
+            "interiors",
+            "costume",
+            "costumes",
+            "wardrobe",
+            "props",
+            "locations",
+        ),
+
+        "Unique Concept": (
+            "concept",
+            "premise",
+            "original concept",
+            "original premise",
+            "unique concept",
+            "originality",
+            "uniqueness",
+            "derivative",
+            "unoriginal",
+            "innovative",
+            "innovation",
+            "inventive",
+            "fresh idea",
+            "fresh concept",
+        ),
+
+        "Emotions": (
+            "emotion",
+            "emotions",
+            "emotional",
+            "emotionally",
+            "heartbreaking",
+            "heartbroken",
+            "heartwarming",
+            "heartfelt",
+            "devastating",
+            "devastated",
+            "i felt",
+            "feel nothing",
+            "felt nothing",
+            "made me feel",
+            "felt emotional",
+        ),
     }
 
     def __init__(self) -> None:
         """
-        Load both ABSA models once.
+        Load the LM6 tokenizer and model once.
         """
 
-        print(
-            "Loading CineView semantic ABSA models..."
+        self.device = torch.device(
+            "cuda"
+            if torch.cuda.is_available()
+            else "cpu"
         )
+
+        print("=" * 70)
+        print("CINEVIEW ASPECT INTELLIGENCE")
+        print("=" * 70)
+        print(f"Model: {self.MODEL_ID}")
+        print(f"Device: {self.device}")
+        print()
 
         # ----------------------------------------------------
         # Tokenizer
         # ----------------------------------------------------
 
+        print("Loading tokenizer...")
+
         self.tokenizer = AutoTokenizer.from_pretrained(
-            self.SENTIMENT_MODEL_ID,
+            self.MODEL_ID,
             use_fast=False,
         )
 
-        # ----------------------------------------------------
-        # Aspect extraction model
-        # ----------------------------------------------------
-
-        aspect_model = (
-            AutoModelForTokenClassification.from_pretrained(
-                self.ASPECT_MODEL_ID
-            )
-        )
-
-        self.aspect_extractor = pipeline(
-            "token-classification",
-            model=aspect_model,
-            tokenizer=self.tokenizer,
-            aggregation_strategy="simple",
-            device=-1,
-        )
+        print("Tokenizer loaded.")
+        print()
 
         # ----------------------------------------------------
-        # Aspect sentiment model
+        # LM6 model
         # ----------------------------------------------------
 
-        sentiment_model = (
+        print("Loading DeBERTa aspect model...")
+
+        self.model = (
             AutoModelForSequenceClassification.from_pretrained(
-                self.SENTIMENT_MODEL_ID
+                self.MODEL_ID
             )
         )
 
-        self.sentiment_classifier = pipeline(
-            "text-classification",
-            model=sentiment_model,
-            tokenizer=self.tokenizer,
-            device=-1,
-            top_k=None,
-        )
+        self.model.to(self.device)
+        self.model.eval()
 
-        print(
-            "CineView semantic ABSA models loaded successfully."
-        )
+        # ----------------------------------------------------
+        # Validate checkpoint configuration
+        # ----------------------------------------------------
+
+        self._validate_model_configuration()
+
+        print("Aspect model loaded successfully.")
+        print()
 
     # ========================================================
-    # Aspect Normalization
+    # MODEL VALIDATION
     # ========================================================
 
-    def _normalize_aspect_name(
-        self,
-        aspect_text: str,
-    ) -> str:
+    def _validate_model_configuration(self) -> None:
         """
-        Map extracted aspect phrases to CineView categories.
+        Validate the downloaded checkpoint before inference.
+
+        CineView expects exactly seven aspect outputs.
+        """
+
+        expected_outputs = len(
+            self.ASPECT_COLUMNS
+        )
+
+        actual_outputs = getattr(
+            self.model.config,
+            "num_labels",
+            None,
+        )
+
+        if actual_outputs != expected_outputs:
+            raise RuntimeError(
+                "Incompatible aspect model configuration: "
+                f"expected {expected_outputs} outputs, "
+                f"received {actual_outputs}."
+            )
+
+    # ========================================================
+    # ASPECT PRESENCE
+    # ========================================================
+
+    def _detect_mentioned_aspects(
+        self,
+        review: str,
+    ) -> set[str]:
+        """
+        Detect aspects that are explicitly referenced.
+
+        This is intentionally conservative.
+
+        IMPORTANT:
+            This method determines only whether an aspect is
+            referenced. It does NOT determine sentiment.
+
+            LM6 remains responsible for the sentiment score.
         """
 
         normalized = " ".join(
-            aspect_text.lower().split()
+            review.lower().split()
         )
 
-        for category, terms in self.ASPECT_CATEGORIES.items():
-            if normalized in terms:
-                return category
+        mentioned: set[str] = set()
 
-        for category, terms in self.ASPECT_CATEGORIES.items():
+        for aspect_name, terms in self.ASPECT_TERMS.items():
             for term in terms:
-                if (
-                    term in normalized
-                    or normalized in term
+                pattern = (
+                    rf"(?<!\w)"
+                    rf"{re.escape(term)}"
+                    rf"(?!\w)"
+                )
+
+                if re.search(
+                    pattern,
+                    normalized,
                 ):
-                    return category
+                    mentioned.add(aspect_name)
+                    break
 
-        return aspect_text.strip().title()
+        return mentioned
 
     # ========================================================
-    # Extract Aspects
+    # SENTIMENT LABEL
     # ========================================================
 
-    def _extract_aspects(
+    def _sentiment_from_score(
         self,
-        text: str,
-    ) -> list[dict[str, Any]]:
+        score: float,
+    ) -> str:
         """
-        Extract semantic aspect spans.
-
-        IMPORTANT:
-        The token-classification pipeline is called directly
-        because the installed Transformers version does not
-        accept truncation/max_length through __call__().
+        Convert the continuous LM6 score into a CineView label.
         """
 
-        entities = self.aspect_extractor(text)
+        if score >= self.NEUTRAL_THRESHOLD:
+            return "Positive"
 
-        aspects: list[dict[str, Any]] = []
+        if score <= -self.NEUTRAL_THRESHOLD:
+            return "Negative"
 
-        for entity in entities:
-            label = str(
-                entity.get("entity_group")
-                or entity.get("entity")
-                or ""
-            )
-
-            # Only keep actual aspect entities.
-            if (
-                "ASP" not in label.upper()
-                and "ASPECT" not in label.upper()
-            ):
-                continue
-
-            aspect = str(
-                entity.get("word", "")
-            ).strip()
-
-            if not aspect:
-                continue
-
-            start = entity.get("start")
-            end = entity.get("end")
-
-            if start is None or end is None:
-                continue
-
-            aspects.append(
-                {
-                    "aspect": aspect,
-                    "start": int(start),
-                    "end": int(end),
-                    "extractor_label": label,
-                    "extractor_confidence": round(
-                        float(
-                            entity.get(
-                                "score",
-                                0.0
-                            )
-                        )
-                        * 100,
-                        2,
-                    ),
-                }
-            )
-
-        return aspects
+        return "Neutral"
 
     # ========================================================
-    # Aspect Sentiment
-    # ========================================================
-
-    def _classify_aspect(
-        self,
-        text: str,
-        aspect: str,
-    ) -> dict[str, Any]:
-        """
-        Run semantic sentiment classification on the
-        (review, aspect) pair.
-        """
-
-        result = self.sentiment_classifier(
-            {
-                "text": text,
-                "text_pair": aspect,
-            }
-        )
-
-        # With top_k=None, Transformers can return:
-        # [
-        #   [
-        #     {"label": "...", "score": ...},
-        #     ...
-        #   ]
-        # ]
-        #
-        # Normalize either nested or flat output.
-
-        if not result:
-            return {
-                "sentiment": "Neutral",
-                "confidence": 0.0,
-                "probabilities": {},
-            }
-
-        if (
-            isinstance(result, list)
-            and result
-            and isinstance(result[0], list)
-        ):
-            scores = result[0]
-        else:
-            scores = result
-
-        probability_map: dict[str, float] = {}
-
-        for item in scores:
-            if not isinstance(item, dict):
-                continue
-
-            label = str(
-                item.get("label", "")
-            ).strip()
-
-            score = float(
-                item.get("score", 0.0)
-            )
-
-            probability_map[label] = round(
-                score * 100,
-                2,
-            )
-
-        if not probability_map:
-            return {
-                "sentiment": "Neutral",
-                "confidence": 0.0,
-                "probabilities": {},
-            }
-
-        best_label = max(
-            probability_map,
-            key=probability_map.get,
-        )
-
-        confidence = probability_map[
-            best_label
-        ]
-
-        normalized_label = (
-            best_label.lower()
-        )
-
-        if "positive" in normalized_label:
-            sentiment = "Positive"
-
-        elif "negative" in normalized_label:
-            sentiment = "Negative"
-
-        else:
-            sentiment = "Neutral"
-
-        return {
-            "sentiment": sentiment,
-            "confidence": confidence,
-            "probabilities": probability_map,
-        }
-
-    # ========================================================
-    # Signed Score
-    # ========================================================
-
-    def _signed_score(
-        self,
-        sentiment: str,
-        confidence: float,
-    ) -> int:
-        """
-        Convert model confidence into a signed UI score.
-        """
-
-        if sentiment == "Positive":
-            return round(confidence)
-
-        if sentiment == "Negative":
-            return round(-confidence)
-
-        return 0
-
-    # ========================================================
-    # Main Analysis
+    # MAIN ANALYSIS
     # ========================================================
 
     def analyze(
@@ -399,100 +341,168 @@ class AspectService:
         text: str,
     ) -> list[dict[str, Any]]:
         """
-        Perform semantic two-stage ABSA.
+        Analyze a movie review across the seven CineView aspects.
+
+        Pipeline:
+
+            review
+              ↓
+            explicit aspect presence gate
+              ↓
+            LM6 continuous aspect scoring
+              ↓
+            Positive / Neutral / Negative
         """
 
-        if not text or not text.strip():
+        if not isinstance(text, str):
+            raise TypeError(
+                "Aspect analysis input must be a string."
+            )
+
+        review = text.strip()
+
+        if not review:
             return []
 
-        extracted_aspects = self._extract_aspects(
-            text
+        # ----------------------------------------------------
+        # Detect aspects actually discussed in the review.
+        # ----------------------------------------------------
+
+        mentioned_aspects = (
+            self._detect_mentioned_aspects(
+                review
+            )
         )
 
-        if not extracted_aspects:
+        # No supported aspect reference.
+        if not mentioned_aspects:
             return []
 
-        results: dict[str, dict[str, Any]] = {}
+        # ----------------------------------------------------
+        # Tokenization
+        # ----------------------------------------------------
 
-        for item in extracted_aspects:
-            raw_aspect = item["aspect"]
+        inputs = self.tokenizer(
+            review,
+            return_tensors="pt",
+            truncation=True,
+            max_length=self.MODEL_MAX_LENGTH,
+            padding=True,
+        )
 
-            category = self._normalize_aspect_name(
-                raw_aspect
+        inputs = {
+            key: value.to(self.device)
+            for key, value in inputs.items()
+        }
+
+        # ----------------------------------------------------
+        # LM6 inference
+        # ----------------------------------------------------
+
+        with torch.inference_mode():
+            outputs = self.model(**inputs)
+
+        logits = outputs.logits
+
+        # Expected shape:
+        #
+        #   [batch_size=1, seven_aspects]
+        #
+        if logits.ndim != 2:
+            raise RuntimeError(
+                "Unexpected aspect model output shape: "
+                f"{tuple(logits.shape)}."
             )
 
-            classification = self._classify_aspect(
-                text,
-                raw_aspect,
+        if logits.shape[0] != 1:
+            raise RuntimeError(
+                "Aspect service expected exactly one review."
             )
 
-            sentiment = classification[
-                "sentiment"
-            ]
+        predictions = (
+            logits[0]
+            .detach()
+            .cpu()
+            .tolist()
+        )
 
-            confidence = classification[
-                "confidence"
-            ]
+        expected_outputs = len(
+            self.ASPECT_COLUMNS
+        )
 
-            score = self._signed_score(
-                sentiment,
-                confidence,
+        if len(predictions) != expected_outputs:
+            raise RuntimeError(
+                "Unexpected number of aspect predictions: "
+                f"expected {expected_outputs}, "
+                f"received {len(predictions)}."
             )
 
-            if category not in results:
-                results[category] = {
-                    "name": category,
-                    "sentiment": sentiment,
-                    "score": score,
-                    "confidence": confidence,
-                    "evidence": [raw_aspect],
-                    "probabilities": classification[
-                        "probabilities"
-                    ],
-                }
+        # ----------------------------------------------------
+        # Build results
+        # ----------------------------------------------------
 
-            else:
-                existing = results[category]
+        results: list[dict[str, Any]] = []
 
-                existing["evidence"].append(
-                    raw_aspect
+        for aspect_name, raw_prediction in zip(
+            self.ASPECT_COLUMNS,
+            predictions,
+        ):
+            # ------------------------------------------------
+            # Presence gate:
+            #
+            # Do not expose an LM6 prediction for an aspect
+            # that the review does not explicitly discuss.
+            # ------------------------------------------------
+
+            if aspect_name not in mentioned_aspects:
+                continue
+
+            raw_score = float(
+                raw_prediction
+            )
+
+            # LM6 is trained around the [-1, +1] rating scale,
+            # but regression outputs can occasionally exceed
+            # those boundaries slightly.
+            bounded_score = max(
+                -1.0,
+                min(
+                    1.0,
+                    raw_score,
+                ),
+            )
+
+            sentiment = (
+                self._sentiment_from_score(
+                    bounded_score
                 )
+            )
 
-                # Keep the strongest mention.
-                if confidence > existing[
-                    "confidence"
-                ]:
-                    existing["sentiment"] = sentiment
-                    existing["score"] = score
-                    existing["confidence"] = (
-                        confidence
-                    )
-                    existing["probabilities"] = (
-                        classification[
-                            "probabilities"
-                        ]
-                    )
+            # This is signal strength only.
+            #
+            # It must NOT be interpreted as a calibrated
+            # probability or model confidence.
+            signal_strength = round(
+                abs(bounded_score) * 100,
+                2,
+            )
 
-        final_results = []
-
-        for result in results.values():
-            final_results.append(
+            results.append(
                 {
-                    "name": result["name"],
-                    "sentiment": result["sentiment"],
-                    "score": result["score"],
-                    "confidence": result[
-                        "confidence"
-                    ],
-                    "evidence": list(
-                        dict.fromkeys(
-                            result["evidence"]
-                        )
-                    )[:4],
-                    "probabilities": result[
-                        "probabilities"
-                    ],
+                    "name": aspect_name,
+                    "sentiment": sentiment,
+                    "score": round(
+                        bounded_score,
+                        4,
+                    ),
+                    "raw_score": round(
+                        raw_score,
+                        4,
+                    ),
+                    "confidence": signal_strength,
+                    "evidence": [],
+                    "probabilities": {},
                 }
             )
 
-        return final_results
+        return results
