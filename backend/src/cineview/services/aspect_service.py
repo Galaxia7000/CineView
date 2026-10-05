@@ -1,20 +1,43 @@
-import re
+from __future__ import annotations
+
 from typing import Any
+
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoModelForTokenClassification,
+    AutoTokenizer,
+    pipeline,
+)
 
 
 class AspectService:
     """
-    Rule-based cinema aspect extraction and sentiment association.
+    Semantic Aspect-Based Sentiment Analysis.
 
-    This service does NOT replace the GRU.
-    The GRU handles overall review sentiment.
+    Stage 1:
+        Extract aspect terms from the review.
 
-    This module identifies movie-related aspects and looks for
-    nearby sentiment-bearing language.
+    Stage 2:
+        Classify sentiment for each (review, aspect) pair.
+
+    Overall review sentiment continues to come from the
+    custom CineView GRU model.
     """
 
-    ASPECTS = {
-        "Acting": [
+    ASPECT_MODEL_ID = (
+        "yangheng/deberta-v3-base-end2end-absa"
+    )
+
+    SENTIMENT_MODEL_ID = (
+        "yangheng/deberta-v3-base-absa-v1.1"
+    )
+
+    # ========================================================
+    # CineView aspect categories
+    # ========================================================
+
+    ASPECT_CATEGORIES = {
+        "Acting": {
             "acting",
             "performance",
             "performances",
@@ -23,433 +46,453 @@ class AspectService:
             "actress",
             "actresses",
             "cast",
-        ],
-        "Story": [
+        },
+        "Story": {
             "story",
             "plot",
             "narrative",
-        ],
-        "Screenplay": [
+            "storyline",
+            "ending",
+        },
+        "Screenplay": {
             "screenplay",
             "script",
             "writing",
-        ],
-        "Direction": [
+            "writer",
+        },
+        "Direction": {
             "direction",
             "director",
             "directing",
-        ],
-        "Cinematography": [
+        },
+        "Cinematography": {
             "cinematography",
             "camera work",
             "camera",
-        ],
-        "Visuals": [
-            "visuals",
+        },
+        "Visuals": {
             "visual",
+            "visuals",
+            "visual effect",
+            "visual effects",
             "effects",
+            "special effects",
             "cgi",
-            "animation",
             "vfx",
-        ],
-        "Music": [
+            "animation",
+            "graphics",
+        },
+        "Music": {
             "music",
             "soundtrack",
             "score",
-            "songs",
             "song",
-        ],
-        "Sound": [
+            "songs",
+        },
+        "Sound": {
             "sound",
             "sound design",
             "audio",
-        ],
-        "Characters": [
+        },
+        "Characters": {
             "character",
             "characters",
             "protagonist",
             "antagonist",
-        ],
-        "Dialogue": [
+        },
+        "Dialogue": {
             "dialogue",
             "dialog",
             "lines",
-        ],
-        "Pacing": [
+        },
+        "Pacing": {
             "pacing",
             "pace",
-            "slow",
-            "fast",
-        ],
+        },
     }
 
-    POSITIVE_WORDS = {
-        "amazing": 2,
-        "awesome": 2,
-        "beautiful": 2,
-        "best": 3,
-        "brilliant": 3,
-        "captivating": 3,
-        "compelling": 2,
-        "delightful": 2,
-        "engaging": 2,
-        "enjoyable": 2,
-        "excellent": 3,
-        "fantastic": 3,
-        "good": 1,
-        "great": 2,
-        "hilarious": 2,
-        "impressive": 2,
-        "incredible": 3,
-        "love": 2,
-        "loved": 2,
-        "masterpiece": 3,
-        "memorable": 2,
-        "moving": 2,
-        "outstanding": 3,
-        "perfect": 3,
-        "phenomenal": 3,
-        "powerful": 2,
-        "remarkable": 3,
-        "satisfying": 2,
-        "spectacular": 3,
-        "strong": 2,
-        "stunning": 3,
-        "superb": 3,
-        "terrific": 3,
-        "wonderful": 3,
-    }
-
-    NEGATIVE_WORDS = {
-        "awful": -3,
-        "bad": -1,
-        "bland": -2,
-        "boring": -3,
-        "confusing": -2,
-        "cringe": -2,
-        "disappointing": -3,
-        "dull": -2,
-        "forgettable": -2,
-        "frustrating": -2,
-        "hate": -2,
-        "hated": -2,
-        "lifeless": -3,
-        "mediocre": -2,
-        "messy": -2,
-        "poor": -2,
-        "pointless": -3,
-        "predictable": -2,
-        "ridiculous": -2,
-        "rough": -1,
-        "shallow": -2,
-        "slow": -2,
-        "terrible": -3,
-        "tedious": -3,
-        "uninspired": -2,
-        "weak": -2,
-        "worse": -2,
-        "worst": -3,
-    }
-
-    NEGATIONS = {
-        "not",
-        "never",
-        "no",
-        "hardly",
-        "barely",
-        "isn't",
-        "wasn't",
-        "weren't",
-        "don't",
-        "didn't",
-        "doesn't",
-        "can't",
-        "couldn't",
-    }
-
-    INTENSIFIERS = {
-        "very": 1.5,
-        "really": 1.5,
-        "incredibly": 1.7,
-        "absolutely": 1.7,
-        "extremely": 1.8,
-        "truly": 1.4,
-        "deeply": 1.4,
-    }
-
-    def _normalize_text(self, text: str) -> str:
+    def __init__(self) -> None:
         """
-        Normalize review text while preserving apostrophes.
+        Load both ABSA models once.
         """
 
-        text = text.lower()
-
-        return re.sub(
-            r"[^a-z0-9'\s.!?,;-]+",
-            " ",
-            text,
+        print(
+            "Loading CineView semantic ABSA models..."
         )
 
-    def _split_sentences(
-        self,
-        text: str,
-    ) -> list[str]:
-        """
-        Split review into reasonably clean sentences.
-        """
+        # ----------------------------------------------------
+        # Tokenizer
+        # ----------------------------------------------------
 
-        sentences = re.split(
-            r"(?<=[.!?])\s+",
-            text,
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.SENTIMENT_MODEL_ID,
+            use_fast=False,
         )
 
-        return [
-            sentence.strip()
-            for sentence in sentences
-            if sentence.strip()
-        ]
+        # ----------------------------------------------------
+        # Aspect extraction model
+        # ----------------------------------------------------
 
-    def _contains_term(
-        self,
-        sentence: str,
-        term: str,
-    ) -> bool:
-        """
-        Check whether an aspect term appears as a whole word
-        or phrase.
-        """
-
-        pattern = rf"\b{re.escape(term)}\b"
-
-        return re.search(
-            pattern,
-            sentence,
-        ) is not None
-
-    def _find_aspect_terms(
-        self,
-        sentence: str,
-    ) -> list[tuple[str, str]]:
-        """
-        Find all known aspect categories mentioned in a sentence.
-        """
-
-        matches: list[tuple[str, str]] = []
-
-        for aspect, terms in self.ASPECTS.items():
-            for term in terms:
-                if self._contains_term(sentence, term):
-                    matches.append((aspect, term))
-
-        return matches
-
-    def _score_tokens(
-        self,
-        sentence: str,
-    ) -> tuple[float, list[str]]:
-        """
-        Calculate sentiment from lexical evidence in a sentence.
-
-        This score is deliberately separate from the GRU's model
-        probability because this is the aspect-analysis layer.
-        """
-
-        tokens = re.findall(
-            r"[a-z]+(?:'[a-z]+)?",
-            sentence.lower(),
-        )
-
-        score = 0.0
-        evidence: list[str] = []
-
-        for index, token in enumerate(tokens):
-            base_score = (
-                self.POSITIVE_WORDS.get(token)
-                or self.NEGATIVE_WORDS.get(token)
+        aspect_model = (
+            AutoModelForTokenClassification.from_pretrained(
+                self.ASPECT_MODEL_ID
             )
+        )
 
-            if base_score is None:
-                continue
+        self.aspect_extractor = pipeline(
+            "token-classification",
+            model=aspect_model,
+            tokenizer=self.tokenizer,
+            aggregation_strategy="simple",
+            device=-1,
+        )
 
-            multiplier = 1.0
+        # ----------------------------------------------------
+        # Aspect sentiment model
+        # ----------------------------------------------------
 
-            if index > 0:
-                previous = tokens[index - 1]
+        sentiment_model = (
+            AutoModelForSequenceClassification.from_pretrained(
+                self.SENTIMENT_MODEL_ID
+            )
+        )
 
-                if previous in self.INTENSIFIERS:
-                    multiplier = self.INTENSIFIERS[previous]
+        self.sentiment_classifier = pipeline(
+            "text-classification",
+            model=sentiment_model,
+            tokenizer=self.tokenizer,
+            device=-1,
+            top_k=None,
+        )
 
-            adjusted_score = base_score * multiplier
+        print(
+            "CineView semantic ABSA models loaded successfully."
+        )
 
-            # Handle simple negation within the previous three tokens.
-            start = max(0, index - 3)
+    # ========================================================
+    # Aspect Normalization
+    # ========================================================
 
-            if any(
-                candidate in self.NEGATIONS
-                for candidate in tokens[start:index]
-            ):
-                adjusted_score *= -1
-
-            score += adjusted_score
-            evidence.append(token)
-
-        return score, evidence
-
-    def _aspect_score(
+    def _normalize_aspect_name(
         self,
-        sentence: str,
-        aspect_term: str,
-    ) -> tuple[float, list[str]]:
-        """
-        Score sentiment around an aspect mention.
-
-        We focus on the sentence containing the aspect, then
-        restrict sentiment evidence to a local context window
-        around the aspect when possible.
-        """
-
-        tokens = sentence.split()
-
-        term_tokens = aspect_term.split()
-
-        normalized_tokens = [
-            re.sub(r"[^a-z']", "", token.lower())
-            for token in tokens
-        ]
-
-        normalized_term_tokens = [
-            token.lower()
-            for token in term_tokens
-        ]
-
-        aspect_index = -1
-
-        for index in range(
-            len(normalized_tokens)
-            - len(normalized_term_tokens)
-            + 1
-        ):
-            if (
-                normalized_tokens[index:index + len(normalized_term_tokens)]
-                == normalized_term_tokens
-            ):
-                aspect_index = index
-                break
-
-        if aspect_index == -1:
-            return self._score_tokens(sentence)
-
-        window_start = max(
-            0,
-            aspect_index - 7,
-        )
-
-        window_end = min(
-            len(tokens),
-            aspect_index + len(term_tokens) + 8,
-        )
-
-        local_sentence = " ".join(
-            tokens[window_start:window_end]
-        )
-
-        return self._score_tokens(local_sentence)
-
-    def _classify_score(
-        self,
-        score: float,
+        aspect_text: str,
     ) -> str:
         """
-        Convert lexical score into an aspect sentiment.
+        Map extracted aspect phrases to CineView categories.
         """
 
-        if score > 0.5:
-            return "Positive"
-
-        if score < -0.5:
-            return "Negative"
-
-        return "Neutral"
-
-    def _build_insight(
-        self,
-        aspect: str,
-        score: float,
-        evidence: list[str],
-    ) -> dict[str, Any]:
-        """
-        Create a frontend-ready aspect result.
-        """
-
-        sentiment = self._classify_score(score)
-
-        # Keep the score bounded so the UI can use it directly.
-        display_score = max(
-            -100,
-            min(
-                100,
-                round(score * 20),
-            ),
+        normalized = " ".join(
+            aspect_text.lower().split()
         )
 
+        for category, terms in self.ASPECT_CATEGORIES.items():
+            if normalized in terms:
+                return category
+
+        for category, terms in self.ASPECT_CATEGORIES.items():
+            for term in terms:
+                if (
+                    term in normalized
+                    or normalized in term
+                ):
+                    return category
+
+        return aspect_text.strip().title()
+
+    # ========================================================
+    # Extract Aspects
+    # ========================================================
+
+    def _extract_aspects(
+        self,
+        text: str,
+    ) -> list[dict[str, Any]]:
+        """
+        Extract semantic aspect spans.
+
+        IMPORTANT:
+        The token-classification pipeline is called directly
+        because the installed Transformers version does not
+        accept truncation/max_length through __call__().
+        """
+
+        entities = self.aspect_extractor(text)
+
+        aspects: list[dict[str, Any]] = []
+
+        for entity in entities:
+            label = str(
+                entity.get("entity_group")
+                or entity.get("entity")
+                or ""
+            )
+
+            # Only keep actual aspect entities.
+            if (
+                "ASP" not in label.upper()
+                and "ASPECT" not in label.upper()
+            ):
+                continue
+
+            aspect = str(
+                entity.get("word", "")
+            ).strip()
+
+            if not aspect:
+                continue
+
+            start = entity.get("start")
+            end = entity.get("end")
+
+            if start is None or end is None:
+                continue
+
+            aspects.append(
+                {
+                    "aspect": aspect,
+                    "start": int(start),
+                    "end": int(end),
+                    "extractor_label": label,
+                    "extractor_confidence": round(
+                        float(
+                            entity.get(
+                                "score",
+                                0.0
+                            )
+                        )
+                        * 100,
+                        2,
+                    ),
+                }
+            )
+
+        return aspects
+
+    # ========================================================
+    # Aspect Sentiment
+    # ========================================================
+
+    def _classify_aspect(
+        self,
+        text: str,
+        aspect: str,
+    ) -> dict[str, Any]:
+        """
+        Run semantic sentiment classification on the
+        (review, aspect) pair.
+        """
+
+        result = self.sentiment_classifier(
+            {
+                "text": text,
+                "text_pair": aspect,
+            }
+        )
+
+        # With top_k=None, Transformers can return:
+        # [
+        #   [
+        #     {"label": "...", "score": ...},
+        #     ...
+        #   ]
+        # ]
+        #
+        # Normalize either nested or flat output.
+
+        if not result:
+            return {
+                "sentiment": "Neutral",
+                "confidence": 0.0,
+                "probabilities": {},
+            }
+
+        if (
+            isinstance(result, list)
+            and result
+            and isinstance(result[0], list)
+        ):
+            scores = result[0]
+        else:
+            scores = result
+
+        probability_map: dict[str, float] = {}
+
+        for item in scores:
+            if not isinstance(item, dict):
+                continue
+
+            label = str(
+                item.get("label", "")
+            ).strip()
+
+            score = float(
+                item.get("score", 0.0)
+            )
+
+            probability_map[label] = round(
+                score * 100,
+                2,
+            )
+
+        if not probability_map:
+            return {
+                "sentiment": "Neutral",
+                "confidence": 0.0,
+                "probabilities": {},
+            }
+
+        best_label = max(
+            probability_map,
+            key=probability_map.get,
+        )
+
+        confidence = probability_map[
+            best_label
+        ]
+
+        normalized_label = (
+            best_label.lower()
+        )
+
+        if "positive" in normalized_label:
+            sentiment = "Positive"
+
+        elif "negative" in normalized_label:
+            sentiment = "Negative"
+
+        else:
+            sentiment = "Neutral"
+
         return {
-            "name": aspect,
             "sentiment": sentiment,
-            "score": display_score,
-            "evidence": list(dict.fromkeys(evidence))[:4],
+            "confidence": confidence,
+            "probabilities": probability_map,
         }
+
+    # ========================================================
+    # Signed Score
+    # ========================================================
+
+    def _signed_score(
+        self,
+        sentiment: str,
+        confidence: float,
+    ) -> int:
+        """
+        Convert model confidence into a signed UI score.
+        """
+
+        if sentiment == "Positive":
+            return round(confidence)
+
+        if sentiment == "Negative":
+            return round(-confidence)
+
+        return 0
+
+    # ========================================================
+    # Main Analysis
+    # ========================================================
 
     def analyze(
         self,
         text: str,
     ) -> list[dict[str, Any]]:
         """
-        Extract movie-related aspects and associate sentiment
-        evidence with each detected aspect.
+        Perform semantic two-stage ABSA.
         """
 
         if not text or not text.strip():
             return []
 
-        normalized_text = self._normalize_text(text)
-
-        sentences = self._split_sentences(
-            normalized_text
+        extracted_aspects = self._extract_aspects(
+            text
         )
+
+        if not extracted_aspects:
+            return []
 
         results: dict[str, dict[str, Any]] = {}
 
-        for sentence in sentences:
-            aspect_matches = self._find_aspect_terms(
-                sentence
+        for item in extracted_aspects:
+            raw_aspect = item["aspect"]
+
+            category = self._normalize_aspect_name(
+                raw_aspect
             )
 
-            for aspect, term in aspect_matches:
-                score, evidence = self._aspect_score(
-                    sentence,
-                    term,
-                )
-
-                if aspect not in results:
-                    results[aspect] = {
-                        "score": 0.0,
-                        "evidence": [],
-                    }
-
-                results[aspect]["score"] += score
-                results[aspect]["evidence"].extend(
-                    evidence
-                )
-
-        insights = []
-
-        for aspect, values in results.items():
-            insights.append(
-                self._build_insight(
-                    aspect=aspect,
-                    score=values["score"],
-                    evidence=values["evidence"],
-                )
+            classification = self._classify_aspect(
+                text,
+                raw_aspect,
             )
 
-        return insights
+            sentiment = classification[
+                "sentiment"
+            ]
+
+            confidence = classification[
+                "confidence"
+            ]
+
+            score = self._signed_score(
+                sentiment,
+                confidence,
+            )
+
+            if category not in results:
+                results[category] = {
+                    "name": category,
+                    "sentiment": sentiment,
+                    "score": score,
+                    "confidence": confidence,
+                    "evidence": [raw_aspect],
+                    "probabilities": classification[
+                        "probabilities"
+                    ],
+                }
+
+            else:
+                existing = results[category]
+
+                existing["evidence"].append(
+                    raw_aspect
+                )
+
+                # Keep the strongest mention.
+                if confidence > existing[
+                    "confidence"
+                ]:
+                    existing["sentiment"] = sentiment
+                    existing["score"] = score
+                    existing["confidence"] = (
+                        confidence
+                    )
+                    existing["probabilities"] = (
+                        classification[
+                            "probabilities"
+                        ]
+                    )
+
+        final_results = []
+
+        for result in results.values():
+            final_results.append(
+                {
+                    "name": result["name"],
+                    "sentiment": result["sentiment"],
+                    "score": result["score"],
+                    "confidence": result[
+                        "confidence"
+                    ],
+                    "evidence": list(
+                        dict.fromkeys(
+                            result["evidence"]
+                        )
+                    )[:4],
+                    "probabilities": result[
+                        "probabilities"
+                    ],
+                }
+            )
+
+        return final_results
